@@ -1,3 +1,5 @@
+#![allow(unsafe_code)] // Intentional FFI wrapper; every unsafe block carries a SAFETY comment.
+
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;

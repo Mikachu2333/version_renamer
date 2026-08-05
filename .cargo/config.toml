@@ -1,0 +1,4 @@
+# Disable incremental compilation: the target filesystem does not support
+# hard links, which makes rustc emit a warning on every build.
+[build]
+incremental = false
