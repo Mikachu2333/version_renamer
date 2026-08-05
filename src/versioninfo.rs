@@ -1,26 +1,34 @@
 #![allow(unsafe_code)] // Intentional FFI wrapper; every unsafe block carries a SAFETY comment.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
+use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows::Win32::Storage::FileSystem::{
     GET_FILE_VERSION_INFO_FLAGS, GetBinaryTypeW, GetFileVersionInfoExW, GetFileVersionInfoSizeExW,
-    VFT_APP, VFT_DLL, VFT_DRV, VFT_FONT, VFT_STATIC_LIB, VFT_UNKNOWN, VFT_VXD, VFT2_DRV_COMM,
-    VFT2_DRV_DISPLAY, VFT2_DRV_INPUTMETHOD, VFT2_DRV_INSTALLABLE, VFT2_DRV_KEYBOARD,
-    VFT2_DRV_LANGUAGE, VFT2_DRV_MOUSE, VFT2_DRV_NETWORK, VFT2_DRV_PRINTER, VFT2_DRV_SOUND,
-    VFT2_DRV_SYSTEM, VFT2_DRV_VERSIONED_PRINTER, VFT2_FONT_RASTER, VFT2_FONT_TRUETYPE,
-    VFT2_FONT_VECTOR, VOS_DOS, VOS_DOS_WINDOWS16, VOS_DOS_WINDOWS32, VOS_NT, VOS_NT_WINDOWS32,
-    VOS_OS216, VOS_OS216_PM16, VOS_OS232, VOS_OS232_PM32, VOS_UNKNOWN, VOS_WINCE, VS_FF_DEBUG,
-    VS_FF_INFOINFERRED, VS_FF_PATCHED, VS_FF_PRERELEASE, VS_FF_PRIVATEBUILD, VS_FF_SPECIALBUILD,
-    VS_FIXEDFILEINFO, VS_FIXEDFILEINFO_FILE_FLAGS, VerQueryValueW,
+    VFT_APP, VFT_DLL, VFT_DRV, VFT_FONT, VFT_STATIC_LIB, VFT_VXD, VFT2_DRV_COMM, VFT2_DRV_DISPLAY,
+    VFT2_DRV_INPUTMETHOD, VFT2_DRV_INSTALLABLE, VFT2_DRV_KEYBOARD, VFT2_DRV_LANGUAGE,
+    VFT2_DRV_MOUSE, VFT2_DRV_NETWORK, VFT2_DRV_PRINTER, VFT2_DRV_SOUND, VFT2_DRV_SYSTEM,
+    VFT2_DRV_VERSIONED_PRINTER, VFT2_FONT_RASTER, VFT2_FONT_TRUETYPE, VFT2_FONT_VECTOR, VOS_DOS,
+    VOS_DOS_WINDOWS16, VOS_DOS_WINDOWS32, VOS_NT, VOS_NT_WINDOWS32, VOS_OS216, VOS_OS216_PM16,
+    VOS_OS232, VOS_OS232_PM32, VOS_WINCE, VS_FF_DEBUG, VS_FF_INFOINFERRED, VS_FF_PATCHED,
+    VS_FF_PRERELEASE, VS_FF_PRIVATEBUILD, VS_FF_SPECIALBUILD, VS_FIXEDFILEINFO,
+    VS_FIXEDFILEINFO_FILE_FLAGS, VerQueryValueW,
+};
+use windows::Win32::System::ApplicationInstallationAndServicing::{
+    MSIHANDLE, MsiCloseHandle, MsiDatabaseOpenViewW, MsiOpenDatabaseW, MsiRecordGetStringW,
+    MsiViewExecute, MsiViewFetch,
 };
 use windows::Win32::System::WindowsProgramming::{SCS_32BIT_BINARY, SCS_64BIT_BINARY};
-use windows::core::{Error, PCWSTR, w};
+use windows::core::{Error, PCWSTR, PWSTR, w};
 
 // SCS_* values not exposed by windows 0.62.2, taken from winnt.h.
 const SCS_ARM64_BINARY: u32 = 10;
 const SCS_ARMNT_BINARY: u32 = 12;
+
+const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 const STRING_KEYS: [&str; 12] = [
     "ProductName",
@@ -84,8 +92,42 @@ impl Default for VersionInfo {
     }
 }
 
+/// Reads version information from a PE file with a version resource, an MSI
+/// package, or an MSIX/AppX package.
+pub fn from_file<P: AsRef<Path>>(path: P) -> Result<VersionInfo, String> {
+    let path = path.as_ref();
+    match from_pe(path) {
+        Ok(info) => Ok(info),
+        Err(pe_error) => {
+            if looks_like_msi(path)
+                && let Ok(info) = from_msi(path)
+            {
+                return Ok(info);
+            }
+            Err(pe_error.to_string())
+        }
+    }
+}
+
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn file_magic(path: &Path) -> Option<[u8; 8]> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).ok()?;
+    Some(magic)
+}
+
+fn looks_like_msi(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    matches!(ext.as_str(), "msi" | "mst" | "msm")
+        || file_magic(path).is_some_and(|m| m == OLE_MAGIC)
 }
 
 /// Queries one string resource for a given (language, code page) translation.
@@ -170,7 +212,6 @@ fn file_type_name(file_type: u32) -> &'static str {
         v if v == VFT_FONT.0 as u32 => "Font",
         v if v == VFT_VXD.0 as u32 => "VirtualDevice",
         v if v == VFT_STATIC_LIB.0 as u32 => "StaticLibrary",
-        v if v == VFT_UNKNOWN.0 as u32 => "Unknown",
         _ => "Unknown",
     }
 }
@@ -217,7 +258,6 @@ fn file_os_name(file_os: u32) -> &'static str {
         v if v == VOS_OS216.0 => "OS216",
         v if v == VOS_OS232.0 => "OS232",
         v if v == VOS_WINCE.0 => "WinCE",
-        v if v == VOS_UNKNOWN.0 => "Unknown",
         _ => "Unknown",
     }
 }
@@ -239,9 +279,17 @@ fn file_flags_name(flags: VS_FIXEDFILEINFO_FILE_FLAGS) -> String {
         .join(",")
 }
 
-pub fn from_file<P: AsRef<Path>>(path: P) -> windows::core::Result<VersionInfo> {
+/// Parses a dotted version string into four fixed components, padding with 0.
+fn parse_version_parts(version: &str) -> [u32; 4] {
+    let mut parts = [0u32; 4];
+    for (i, part) in version.split('.').take(4).enumerate() {
+        parts[i] = part.trim().parse().unwrap_or(0);
+    }
+    parts
+}
+
+fn from_pe(path: &Path) -> windows::core::Result<VersionInfo> {
     let path_wide: Vec<u16> = path
-        .as_ref()
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
@@ -350,4 +398,173 @@ pub fn from_file<P: AsRef<Path>>(path: P) -> windows::core::Result<VersionInfo> 
     }
 
     Ok(info)
+}
+
+fn from_msi(path: &Path) -> Result<VersionInfo, String> {
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut db = MSIHANDLE(0);
+        // SAFETY: `path_wide` is a valid null-terminated wide string; `db` is
+        // a valid out handle.
+        let rc = MsiOpenDatabaseW(PCWSTR(path_wide.as_ptr()), w!("0"), &raw mut db);
+        if rc != ERROR_SUCCESS.0 {
+            return Err(format!("failed to open MSI database (error {rc})"));
+        }
+        let result = read_msi_properties(db);
+        // SAFETY: `db` is a valid handle returned by MsiOpenDatabaseW.
+        MsiCloseHandle(db);
+        result
+    }
+}
+
+fn read_msi_properties(db: MSIHANDLE) -> Result<VersionInfo, String> {
+    let mut info = VersionInfo::default();
+    let mut product_version = None;
+    let mut template = None;
+    for key in [
+        "ProductName",
+        "ProductVersion",
+        "Manufacturer",
+        "Template",
+        "ProductCode",
+        "ARPCOMMENTS",
+        "Subject",
+    ] {
+        let value = unsafe { msi_query_string(db, key) }?;
+        if let Some(value) = value {
+            match key {
+                "ProductName" => info.product_name = OsString::from(value),
+                "ProductVersion" => product_version = Some(value),
+                "Manufacturer" => info.company_name = OsString::from(value),
+                "Template" => template = Some(value),
+                "ProductCode" => info.internal_name = OsString::from(value),
+                "ARPCOMMENTS" => info.comments = OsString::from(value),
+                "Subject" => info.file_description = OsString::from(value),
+                _ => {}
+            }
+        }
+    }
+    if let Some(version) = product_version {
+        let parts = parse_version_parts(&version);
+        info.file_version = OsString::from(&version);
+        info.product_version = OsString::from(version);
+        info.fixed = Some(FixedFileInfo {
+            file_version: parts,
+            product_version: parts,
+            file_type: "MSI".to_owned(),
+            file_subtype: String::new(),
+            file_os: String::new(),
+            file_flags: String::new(),
+        });
+    }
+    if let Some(template) = template {
+        msi_arch(&template).clone_into(&mut info.arch);
+    }
+    Ok(info)
+}
+
+unsafe fn msi_query_string(db: MSIHANDLE, property: &str) -> Result<Option<String>, String> {
+    let query = format!("SELECT `Value` FROM `Property` WHERE `Property` = '{property}'");
+    let query_wide = to_wide(&query);
+    let mut view = MSIHANDLE(0);
+    // SAFETY: `query_wide` is a valid null-terminated wide string; `view` is
+    // a valid out handle.
+    let rc = unsafe { MsiDatabaseOpenViewW(db, PCWSTR(query_wide.as_ptr()), &raw mut view) };
+    if rc != ERROR_SUCCESS.0 {
+        return Err(format!("failed to open MSI view (error {rc})"));
+    }
+    // SAFETY: `view` is a valid handle; MSIHANDLE(0) is the null record handle.
+    let rc = unsafe { MsiViewExecute(view, MSIHANDLE(0)) };
+    if rc != ERROR_SUCCESS.0 {
+        unsafe { MsiCloseHandle(view) };
+        return Err(format!("failed to execute MSI view (error {rc})"));
+    }
+    let mut record = MSIHANDLE(0);
+    // SAFETY: `record` is a valid out handle.
+    let rc = unsafe { MsiViewFetch(view, &raw mut record) };
+    if rc == ERROR_NO_MORE_ITEMS.0 {
+        unsafe { MsiCloseHandle(view) };
+        return Ok(None);
+    }
+    if rc != ERROR_SUCCESS.0 {
+        unsafe { MsiCloseHandle(view) };
+        return Err(format!("failed to fetch MSI record (error {rc})"));
+    }
+    // SAFETY: `record` is a valid handle returned by MsiViewFetch.
+    let value = unsafe { msi_record_string(record, 1) };
+    unsafe { MsiCloseHandle(record) };
+    unsafe { MsiCloseHandle(view) };
+    value.map(Some)
+}
+
+unsafe fn msi_record_string(record: MSIHANDLE, field: u32) -> Result<String, String> {
+    let mut len = 0u32;
+    // SAFETY: `len` is a valid out pointer; the null buffer asks for the size.
+    let rc = unsafe { MsiRecordGetStringW(record, field, None, Some(&raw mut len)) };
+    if rc != ERROR_SUCCESS.0 {
+        return Err(format!("failed to read MSI string length (error {rc})"));
+    }
+    if len == 0 {
+        return Ok(String::new());
+    }
+    let mut buffer = vec![0u16; (len + 1) as usize];
+    let mut capacity = u32::try_from(buffer.len()).unwrap();
+    // SAFETY: `buffer` is writable for `len` UTF-16 code units (including the
+    // null terminator) and `len` is a valid in/out pointer.
+    let rc = unsafe {
+        MsiRecordGetStringW(
+            record,
+            field,
+            Some(PWSTR(buffer.as_mut_ptr())),
+            Some(&raw mut capacity),
+        )
+    };
+    if rc != ERROR_SUCCESS.0 {
+        return Err(format!("failed to read MSI string (error {rc})"));
+    }
+    let end = buffer.iter().position(|&u| u == 0).unwrap_or(buffer.len());
+    Ok(String::from_utf16_lossy(&buffer[..end]))
+}
+
+fn msi_arch(template: &str) -> &'static str {
+    let t = template.to_ascii_lowercase();
+    if t.contains("arm64") {
+        "arm64"
+    } else if t.contains("arm") {
+        "arm"
+    } else if t.contains("x64") || t.contains("intel64") || t.contains("amd64") {
+        "x64"
+    } else if t.contains("intel") || t.contains("x86") {
+        "x86"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_msi_template_to_arch() {
+        assert_eq!(msi_arch("x64;1033"), "x64");
+        assert_eq!(msi_arch("Intel;1033"), "x86");
+        assert_eq!(msi_arch("Intel64;1033"), "x64");
+        assert_eq!(msi_arch("Arm64;1033"), "arm64");
+        assert_eq!(msi_arch("Arm;1033"), "arm");
+        assert_eq!(msi_arch(""), "unknown");
+    }
+
+    #[test]
+    fn parses_version_strings_into_fixed_parts() {
+        assert_eq!(parse_version_parts("26.5.0"), [26, 5, 0, 0]);
+        assert_eq!(parse_version_parts("7.6.4.0"), [7, 6, 4, 0]);
+        assert_eq!(parse_version_parts("1.2.3.4.5"), [1, 2, 3, 4]);
+        assert_eq!(parse_version_parts(""), [0, 0, 0, 0]);
+        assert_eq!(parse_version_parts("a.b"), [0, 0, 0, 0]);
+    }
 }

@@ -53,6 +53,8 @@ fn print_help(program: &OsString) {
         r"This is Version Renamer for Windows Executables, you can rename your exe files with patterns."
     );
     println!("Version: {}\n", env!("CARGO_PKG_VERSION"));
+    println!("Supported files: PE executables (exe/dll/sys) with version info,");
+    println!("  MSI packages.\n");
     println!("Usage:");
     println!("  {name} <FILE> [PATTERN]");
     println!("  {name} <PATTERN> <FILE>");
@@ -86,6 +88,8 @@ fn print_help(program: &OsString) {
         "If the resulting file name exceeds {MAX_FILE_NAME_CHARS} characters, the default pattern is used;"
     );
     println!("if that is still too long, the original file name is kept.");
+    println!();
+    println!("Placeholders with no value for the given file type render as \u{FFFD}.");
 }
 
 /// Returns a `(file_path, pattern)` pair, accepting either `FILE [PATTERN]` or
@@ -259,7 +263,6 @@ fn render_pattern(pattern: &str, info: &versioninfo::VersionInfo, original_name:
         .as_ref()
         .map(|f| f.product_version.map(|n| n.to_string()))
         .unwrap_or_default();
-
     let mut out = String::new();
     let mut rest = pattern;
     while let Some(start) = rest.find('{') {
@@ -301,7 +304,7 @@ fn render_pattern(pattern: &str, info: &versioninfo::VersionInfo, original_name:
                     continue;
                 }
             };
-            out.push_str(value);
+            out.push_str(fill_missing(value));
             rest = &after[end + 1..];
         } else {
             out.push('{');
@@ -320,6 +323,10 @@ fn version_part(version: &str, index: usize) -> String {
         .unwrap_or("")
         .trim()
         .to_owned()
+}
+
+fn fill_missing(value: &str) -> &str {
+    if value.is_empty() { "\u{FFFD}" } else { value }
 }
 
 /// Replaces characters that are invalid in Windows file names and rejects
@@ -461,6 +468,21 @@ mod tests {
             OsStr::new("x.exe"),
         );
         assert_eq!(out, "10.0.26100.8875 (extra)");
+    }
+
+    #[test]
+    fn missing_fields_render_replacement_char() {
+        let info = versioninfo::VersionInfo {
+            arch: "x64".to_owned(),
+            product_name: OsString::from("App"),
+            ..Default::default()
+        };
+        let out = render_pattern(
+            "{Name}-{Comments}-{Copyright}-{FileVer}-{Flags}",
+            &info,
+            OsStr::new("x.exe"),
+        );
+        assert_eq!(out, "App-\u{FFFD}-\u{FFFD}-\u{FFFD}-\u{FFFD}");
     }
 
     #[test]
