@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+windows = { version = "0.62.2", default-features = false, features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
