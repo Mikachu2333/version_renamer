@@ -18,11 +18,36 @@ use windows::Win32::Storage::FileSystem::{
     VS_FIXEDFILEINFO_FILE_FLAGS, VerQueryValueW,
 };
 use windows::Win32::System::ApplicationInstallationAndServicing::{
-    MSIHANDLE, MsiCloseHandle, MsiDatabaseOpenViewW, MsiOpenDatabaseW, MsiRecordGetStringW,
-    MsiViewExecute, MsiViewFetch,
+    MSIHANDLE, MsiCloseHandle, MsiDatabaseOpenViewW, MsiGetSummaryInformationW, MsiOpenDatabaseW,
+    MsiRecordGetStringW, MsiViewExecute, MsiViewFetch,
 };
 use windows::Win32::System::WindowsProgramming::{SCS_32BIT_BINARY, SCS_64BIT_BINARY};
 use windows::core::{Error, PCWSTR, PWSTR, w};
+
+// MSI SummaryInformation property IDs (OLE PID values).
+const PID_TEMPLATE: u32 = 7;
+const ERROR_UNKNOWN_PROPERTY: u32 = 160;
+
+// MsiSummaryInfoGetPropertyW is not exposed by windows 0.62.2.
+#[link(name = "msi", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn MsiSummaryInfoGetPropertyW(
+        hsummaryinfo: u32,
+        property: u32,
+        puidatatype: *mut u32,
+        pivalue: *mut i32,
+        pftvalue: *mut FileTime,
+        szvaluebuf: *mut u16,
+        pcchvaluebuf: *mut u32,
+    ) -> u32;
+}
+
+/// Layout-compatible FILETIME for the summary property query.
+#[repr(C)]
+struct FileTime {
+    dw_low_date_time: u32,
+    dw_high_date_time: u32,
+}
 
 // SCS_* values not exposed by windows 0.62.2, taken from winnt.h.
 const SCS_ARM64_BINARY: u32 = 10;
@@ -464,7 +489,83 @@ fn read_msi_properties(db: MSIHANDLE) -> Result<VersionInfo, String> {
     if let Some(template) = template {
         msi_arch(&template).clone_into(&mut info.arch);
     }
+    if info.arch.is_empty()
+        && let Ok(Some(summary_template)) = msi_summary_template(db)
+    {
+        msi_arch(&summary_template).clone_into(&mut info.arch);
+    }
     Ok(info)
+}
+
+/// Reads the `Template` property from the MSI `SummaryInformation` stream, e.g.
+/// `x64;1033` or `Intel;1033`. Architecture is not always in the Property
+/// table, so this is the reliable source.
+fn msi_summary_template(db: MSIHANDLE) -> Result<Option<String>, String> {
+    unsafe {
+        let mut summary = MSIHANDLE(0);
+        // SAFETY: `db` is a valid database handle; `summary` is a valid out
+        // handle; the database path is optional (null).
+        let rc = MsiGetSummaryInformationW(db, PCWSTR(std::ptr::null()), 0, &raw mut summary);
+        if rc != ERROR_SUCCESS.0 {
+            return Err(format!(
+                "failed to open MSI summary information (error {rc})"
+            ));
+        }
+        let mut data_type = 0u32;
+        let mut int_value = 0i32;
+        let mut file_time = FileTime {
+            dw_low_date_time: 0,
+            dw_high_date_time: 0,
+        };
+        let mut len = 0u32;
+        // SAFETY: all out pointers are valid; the null buffer asks for the
+        // required size of the string property.
+        let rc = MsiSummaryInfoGetPropertyW(
+            summary.0,
+            PID_TEMPLATE,
+            &raw mut data_type,
+            &raw mut int_value,
+            &raw mut file_time,
+            std::ptr::null_mut(),
+            &raw mut len,
+        );
+        if rc == ERROR_UNKNOWN_PROPERTY || len == 0 {
+            // SAFETY: `summary` is a valid handle returned by MsiGetSummaryInformationW.
+            MsiCloseHandle(summary);
+            return Ok(None);
+        }
+        if rc != ERROR_SUCCESS.0 {
+            // SAFETY: `summary` is a valid handle returned by MsiGetSummaryInformationW.
+            MsiCloseHandle(summary);
+            return Err(format!("failed to read MSI summary property (error {rc})"));
+        }
+
+        let mut buffer = vec![0u16; (len + 1) as usize];
+        let mut capacity = u32::try_from(buffer.len()).unwrap();
+        // SAFETY: `buffer` is writable for `capacity` UTF-16 code units
+        // (including the null terminator); the other out pointers are valid.
+        let rc = MsiSummaryInfoGetPropertyW(
+            summary.0,
+            PID_TEMPLATE,
+            &raw mut data_type,
+            &raw mut int_value,
+            &raw mut file_time,
+            buffer.as_mut_ptr(),
+            &raw mut capacity,
+        );
+        // SAFETY: `summary` is a valid handle returned by MsiGetSummaryInformationW.
+        MsiCloseHandle(summary);
+        if rc != ERROR_SUCCESS.0 {
+            return Err(format!("failed to read MSI summary property (error {rc})"));
+        }
+        let end = buffer.iter().position(|&u| u == 0).unwrap_or(buffer.len());
+        let value = String::from_utf16_lossy(&buffer[..end]);
+        if value.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    }
 }
 
 unsafe fn msi_query_string(db: MSIHANDLE, property: &str) -> Result<Option<String>, String> {
