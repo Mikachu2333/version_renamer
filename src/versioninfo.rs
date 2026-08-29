@@ -5,7 +5,9 @@ use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::arch_probe::{ContentProbe, probe as probe_payload};
+use crate::arch_probe::{
+    ArchEvidence, ContentProbe, merge_architectures, probe as probe_payload,
+};
 use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows::Win32::Storage::FileSystem::{
     GET_FILE_VERSION_INFO_FLAGS, GetBinaryTypeW, GetFileVersionInfoExW, GetFileVersionInfoSizeExW,
@@ -232,12 +234,28 @@ pub(crate) fn binary_arch_from_file(path: &Path) -> String {
     detect_arch(PCWSTR(wide.as_ptr()))
 }
 
-/// MSI payload architecture from its `Template` properties; `None` when the
-/// package is unreadable or carries no known platform token.
-pub(crate) fn msi_arch_from_file(path: &Path) -> Option<String> {
-    match from_msi(path) {
-        Ok(info) if !info.arch.is_empty() && info.arch != "unknown" => Some(info.arch),
-        _ => None,
+/// Payload architecture evidence from an MSI `Template` property; empty when
+/// the package is unreadable. Used on MSIs unpacked from installers.
+pub(crate) fn msi_evidence_from_file(path: &Path) -> Vec<ArchEvidence> {
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut db = MSIHANDLE(0);
+        // SAFETY: `path_wide` is a valid null-terminated wide string; `db` is
+        // a valid out handle.
+        let rc = MsiOpenDatabaseW(PCWSTR(path_wide.as_ptr()), w!("0"), &raw mut db);
+        if rc != ERROR_SUCCESS.0 {
+            return Vec::new();
+        }
+        let template = msi_template(db).ok().flatten();
+        // SAFETY: `db` is a valid handle returned by MsiOpenDatabaseW.
+        MsiCloseHandle(db);
+        template
+            .map(|t| msi_template_evidence(&t))
+            .unwrap_or_default()
     }
 }
 
@@ -343,10 +361,11 @@ fn apply_payload_probe(path: &Path, info: &mut VersionInfo) {
     }
     match probe_payload(path, &info.arch) {
         ContentProbe::Found(arch) => info.arch = arch,
-        // Rendered as U+FFFD by the pattern engine; a wrong "x86" would be
-        // worse than an explicit unknown. This covers multi-arch (fat)
-        // payloads as well as opaque installer formats.
+        // Payload evidence includes machine types outside the supported
+        // platforms; rendered as U+FFFD by the pattern engine.
         ContentProbe::Unknown => info.arch.clear(),
+        // Opaque installer formats, a missing 7-Zip, or evidence-free
+        // unpacked contents keep the shell architecture.
         ContentProbe::Inconclusive => {}
     }
 }
@@ -488,12 +507,10 @@ fn from_msi(path: &Path) -> Result<VersionInfo, String> {
 fn read_msi_properties(db: MSIHANDLE) -> Result<VersionInfo, String> {
     let mut info = VersionInfo::default();
     let mut product_version = None;
-    let mut template = None;
     for key in [
         "ProductName",
         "ProductVersion",
         "Manufacturer",
-        "Template",
         "ProductCode",
         "ARPCOMMENTS",
         "Subject",
@@ -504,7 +521,6 @@ fn read_msi_properties(db: MSIHANDLE) -> Result<VersionInfo, String> {
                 "ProductName" => info.product_name = OsString::from(value),
                 "ProductVersion" => product_version = Some(value),
                 "Manufacturer" => info.company_name = OsString::from(value),
-                "Template" => template = Some(value),
                 "ProductCode" => info.internal_name = OsString::from(value),
                 "ARPCOMMENTS" => info.comments = OsString::from(value),
                 "Subject" => info.file_description = OsString::from(value),
@@ -525,15 +541,20 @@ fn read_msi_properties(db: MSIHANDLE) -> Result<VersionInfo, String> {
             file_flags: String::new(),
         });
     }
-    if let Some(template) = template {
-        msi_arch(&template).clone_into(&mut info.arch);
-    }
-    if info.arch.is_empty()
-        && let Ok(Some(summary_template)) = msi_summary_template(db)
-    {
-        msi_arch(&summary_template).clone_into(&mut info.arch);
+    if let Some(template) = msi_template(db)? {
+        msi_arch_token(&template).clone_into(&mut info.arch);
     }
     Ok(info)
+}
+
+/// Reads the `Template` property: the Property table first, the summary
+/// information stream as a fallback.
+fn msi_template(db: MSIHANDLE) -> Result<Option<String>, String> {
+    if let Some(value) = unsafe { msi_query_string(db, "Template")? } {
+        return Ok(Some(value));
+    }
+    // A missing or unreadable summary stream is not fatal.
+    Ok(msi_summary_template(db).ok().flatten())
 }
 
 /// Reads the `Template` property from the MSI `SummaryInformation` stream, e.g.
@@ -670,18 +691,31 @@ unsafe fn msi_record_string(record: MSIHANDLE, field: u32) -> Result<String, Str
     Ok(String::from_utf16_lossy(&buffer[..end]))
 }
 
-fn msi_arch(template: &str) -> &'static str {
-    let t = template.to_ascii_lowercase();
-    if t.contains("arm64") {
-        "arm64"
-    } else if t.contains("arm") {
-        "arm"
-    } else if t.contains("x64") || t.contains("intel64") || t.contains("amd64") {
-        "x64"
-    } else if t.contains("intel") || t.contains("x86") {
-        "x86"
-    } else {
-        "unknown"
+/// Parses the platform tokens of an MSI `Template` property into payload
+/// evidence. Unknown tokens are skipped; the legacy 32-bit `Arm` platform
+/// counts as unrecognized.
+fn msi_template_evidence(template: &str) -> Vec<ArchEvidence> {
+    template
+        .split(';')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter_map(|token| match token.as_str() {
+            "intel" | "x86" => Some(ArchEvidence::X86),
+            "intel64" | "amd64" | "x64" => Some(ArchEvidence::X64),
+            "arm64" => Some(ArchEvidence::Arm64),
+            "arm" => Some(ArchEvidence::Unrecognized),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `{Arch}` token for an MSI `Template` property, merging multi-platform
+/// templates (e.g. `Intel;AMD64;Arm64;1033` renders as `x86+arm64`).
+fn msi_arch_token(template: &str) -> String {
+    match merge_architectures(&msi_template_evidence(template)) {
+        Some(arch) => arch.to_owned(),
+        // No recognized platform token, or the legacy 32-bit `Arm` platform:
+        // the explicit unknown placeholder.
+        None => "unknown".to_owned(),
     }
 }
 
@@ -691,12 +725,23 @@ mod tests {
 
     #[test]
     fn maps_msi_template_to_arch() {
-        assert_eq!(msi_arch("x64;1033"), "x64");
-        assert_eq!(msi_arch("Intel;1033"), "x86");
-        assert_eq!(msi_arch("Intel64;1033"), "x64");
-        assert_eq!(msi_arch("Arm64;1033"), "arm64");
-        assert_eq!(msi_arch("Arm;1033"), "arm");
-        assert_eq!(msi_arch(""), "unknown");
+        assert_eq!(msi_arch_token("x64;1033"), "x64");
+        assert_eq!(msi_arch_token("Intel;1033"), "x86");
+        assert_eq!(msi_arch_token("Intel64;1033"), "x64");
+        assert_eq!(msi_arch_token("AMD64;1033"), "x64");
+        assert_eq!(msi_arch_token("Arm64;1033"), "arm64");
+        // The legacy 32-bit Arm platform and unrecognized tokens stay unknown.
+        assert_eq!(msi_arch_token("Arm;1033"), "unknown");
+        assert_eq!(msi_arch_token(""), "unknown");
+        assert_eq!(msi_arch_token("xyz;1033"), "unknown");
+    }
+
+    #[test]
+    fn merges_msi_multi_platform_templates() {
+        assert_eq!(msi_arch_token("Intel;AMD64;1033"), "x86");
+        assert_eq!(msi_arch_token("Intel;Arm64;1033"), "x86+arm64");
+        assert_eq!(msi_arch_token("AMD64;Arm64;1033"), "x64+arm64");
+        assert_eq!(msi_arch_token("Intel;AMD64;Arm64;1033"), "x86+arm64");
     }
 
     #[test]

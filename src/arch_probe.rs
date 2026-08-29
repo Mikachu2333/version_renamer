@@ -13,15 +13,20 @@
 //! 3. NSIS via 7-Zip: when the NSIS first-header magic is present, unpack
 //!    with 7z if it is available and judge the unpacked executables/MSIs.
 //!
-//! Each channel yields an evidence set of machine types. Exactly one
-//! architecture wins; several mean a multi-arch (fat) package. Evidence
-//! matching the shell architecture is ignored (loader machinery matches its
-//! loader), and NSIS engine plugin DLLs are ignored entirely.
+//! Each channel yields a set of machine-type evidence. The evidence merges
+//! into one token: x86 subsumes x64 (an x86 shell ships both), arm64 pairs
+//! with whichever x86 flavor is present (`x86+arm64` / `x64+arm64`), and any
+//! machine type outside those three platforms (ARM32 included) makes the
+//! verdict unknown. Evidence matching the shell architecture is ignored
+//! (loader machinery matches its loader), and NSIS engine plugin DLLs are
+//! ignored entirely.
 //!
-//! Recognized installers whose payload stays opaque (e.g. Inno Setup, whose
-//! compressed payload has no lightweight Rust reader), as well as multi-arch
-//! evidence, report [`ContentProbe::Unknown`] so the caller can render an
-//! unknown placeholder instead of a misleading architecture.
+//! Channels without usable payload evidence (opaque installer formats such
+//! as Inno Setup, a missing 7-Zip, or unpacked contents without any
+//! executable or MSI) report [`ContentProbe::Inconclusive`], so the caller
+//! keeps the shell architecture instead of a misleading unknown. Only
+//! evidence containing unsupported machine types reports
+//! [`ContentProbe::Unknown`].
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -30,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::versioninfo::{OLE_MAGIC, binary_arch_from_file, msi_arch_from_file};
+use crate::versioninfo::{OLE_MAGIC, binary_arch_from_file, msi_evidence_from_file};
 
 // NSIS first header: `flags(4) | 0xDEADBEEF(4) | "NullsoftInst"(12)`.
 const NSIS_MAGIC: [u8; 16] = [
@@ -58,14 +63,59 @@ const MAX_EMBEDDED_MSI_BYTES: u64 = 2 << 30;
 /// Upper bound for embedded-MSI extraction attempts per file.
 const MAX_EMBEDDED_MSI_CANDIDATES: usize = 8;
 
+/// One item of payload architecture evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchEvidence {
+    X86,
+    X64,
+    Arm64,
+    /// ARM32 or any other machine type outside the three supported
+    /// platforms; its presence makes the whole verdict unknown.
+    Unrecognized,
+}
+
+/// Merges payload evidence into the `{Arch}` token: x86 subsumes x64, arm64
+/// pairs with whichever x86 flavor is present, and an unrecognized machine
+/// type poisons the verdict. An empty slice also yields `None`; callers
+/// decide whether that means "no evidence" or an explicit unknown.
+pub(crate) fn merge_architectures(evidence: &[ArchEvidence]) -> Option<&'static str> {
+    if evidence.contains(&ArchEvidence::Unrecognized) {
+        return None;
+    }
+    let x86 = evidence.contains(&ArchEvidence::X86);
+    let x64 = evidence.contains(&ArchEvidence::X64);
+    let arm64 = evidence.contains(&ArchEvidence::Arm64);
+    match (x86, x64, arm64) {
+        (true, _, true) => Some("x86+arm64"),
+        (false, true, true) => Some("x64+arm64"),
+        (false, false, true) => Some("arm64"),
+        (true, _, false) => Some("x86"),
+        (false, true, false) => Some("x64"),
+        (false, false, false) => None,
+    }
+}
+
+/// Merges a collected evidence set into a payload verdict; `None` when no
+/// evidence was collected at all.
+fn verdict_from_evidence(evidence: &[ArchEvidence]) -> Option<PayloadVerdict> {
+    if evidence.is_empty() {
+        return None;
+    }
+    match merge_architectures(evidence) {
+        Some(arch) => Some(PayloadVerdict::Arch(arch.to_owned())),
+        None => Some(PayloadVerdict::Unknown),
+    }
+}
+
 /// Verdict for a set of payload architecture evidence.
 #[derive(Debug)]
 enum PayloadVerdict {
-    /// Exactly one architecture stands out.
+    /// The evidence merged into one token: a plain architecture or a
+    /// combined one such as `x86+arm64`.
     Arch(String),
-    /// Evidence for several machine types: a multi-arch (fat) package with
-    /// no single answer.
-    Mixed,
+    /// Evidence exists but includes machine types outside the supported
+    /// platforms, so no architecture can be attributed.
+    Unknown,
     /// No usable payload evidence was found.
     NoEvidence,
 }
@@ -75,11 +125,10 @@ enum PayloadVerdict {
 pub(crate) enum ContentProbe {
     /// The payload architecture was determined.
     Found(String),
-    /// No single architecture can be attributed: the payload carries
-    /// evidence for several machine types, or a recognized installer
-    /// format's payload is not statically readable.
+    /// The payload carries evidence for machine types outside the supported
+    /// platforms, so no architecture can be attributed.
     Unknown,
-    /// No known installer traits were found; the shell architecture stands.
+    /// No payload evidence either way; the shell architecture stands.
     Inconclusive,
 }
 
@@ -87,8 +136,8 @@ pub(crate) enum ContentProbe {
 #[derive(Debug)]
 enum ReaderProbe {
     Found(String),
-    /// No single architecture can be attributed (multi-arch evidence or an
-    /// opaque installer format).
+    /// Payload evidence exists but includes machine types outside the
+    /// supported platforms.
     Unknown,
     NsisDetected,
     Inconclusive,
@@ -118,9 +167,10 @@ pub(crate) fn probe(path: &Path, shell_arch: &str) -> ContentProbe {
         ReaderProbe::Unknown => ContentProbe::Unknown,
         ReaderProbe::NsisDetected => match nsis_payload_arch(path, shell_arch) {
             PayloadVerdict::Arch(arch) => ContentProbe::Found(arch),
-            // An x86 shell is never a trustworthy answer for an NSIS
-            // package, so missing payload evidence also means unknown.
-            PayloadVerdict::Mixed | PayloadVerdict::NoEvidence => ContentProbe::Unknown,
+            PayloadVerdict::Unknown => ContentProbe::Unknown,
+            // A missing 7-Zip, a failed unpack, or unpacked contents without
+            // any executable or MSI: the shell architecture stands.
+            PayloadVerdict::NoEvidence => ContentProbe::Inconclusive,
         },
         ReaderProbe::Inconclusive => ContentProbe::Inconclusive,
     }
@@ -131,7 +181,7 @@ fn probe_reader<R: Read + Seek>(reader: &mut R, file_len: u64, shell_arch: &str)
 
     match embedded_images_verdict(reader, &scan.mz_candidates, shell_arch) {
         Some(PayloadVerdict::Arch(arch)) => return ReaderProbe::Found(arch),
-        Some(PayloadVerdict::Mixed) => return ReaderProbe::Unknown,
+        Some(PayloadVerdict::Unknown) => return ReaderProbe::Unknown,
         Some(PayloadVerdict::NoEvidence) | None => {}
     }
     // Recognized installer formats take precedence over an embedded OLE
@@ -142,11 +192,13 @@ fn probe_reader<R: Read + Seek>(reader: &mut R, file_len: u64, shell_arch: &str)
         return ReaderProbe::NsisDetected;
     }
     if scan.is_inno {
-        return ReaderProbe::Unknown;
+        // The Inno Setup payload is compressed and opaque to static
+        // scanning, so the shell architecture stands.
+        return ReaderProbe::Inconclusive;
     }
     match embedded_msi_verdict(reader, &scan.ole_candidates, file_len) {
         Some(PayloadVerdict::Arch(arch)) => ReaderProbe::Found(arch),
-        Some(PayloadVerdict::Mixed) => ReaderProbe::Unknown,
+        Some(PayloadVerdict::Unknown) => ReaderProbe::Unknown,
         Some(PayloadVerdict::NoEvidence) | None => ReaderProbe::Inconclusive,
     }
 }
@@ -219,10 +271,9 @@ fn scan_slice(buf: &[u8], base: u64, scan: &mut Scan) {
     }
 }
 
-/// Reads the COFF header of an embedded PE image and estimates its stored
-/// size from the section table. The largest embedded image is the payload's
-/// main executable with high probability.
-fn read_image_header<R: Read + Seek>(reader: &mut R, mz_offset: u64) -> Option<(u16, u64)> {
+/// Reads the COFF header of an embedded PE image and validates its section
+/// table, so random `MZ` hits inside compressed data are rejected.
+fn read_image_header<R: Read + Seek>(reader: &mut R, mz_offset: u64) -> Option<u16> {
     reader.seek(SeekFrom::Start(mz_offset)).ok()?;
     let mut hdr = [0u8; 0x4000];
     let mut read = 0usize;
@@ -248,69 +299,61 @@ fn read_image_header<R: Read + Seek>(reader: &mut R, mz_offset: u64) -> Option<(
     if table_end > read {
         return None;
     }
-    let mut raw_end = 0u64;
-    for s in 0..sections {
-        let o = table + 40 * s;
-        let size = u64::from(u32_le(&hdr, o + 16)?);
-        let ptr = u64::from(u32_le(&hdr, o + 20)?);
-        raw_end = raw_end.max(size + ptr);
-    }
-    Some((machine, raw_end))
+    Some(machine)
 }
 
 /// Judges the embedded PE images. Hits matching the shell architecture
 /// carry no information (installer machinery matches its loader), so only
-/// other machine types count as payload evidence; the largest image per
-/// architecture represents it. One non-shell architecture wins outright,
-/// several mean a multi-arch package with no single answer.
+/// other machine types count as payload evidence. The evidence set merges
+/// into one token; machine types outside the supported platforms poison it.
 fn embedded_images_verdict<R: Read + Seek>(
     reader: &mut R,
     candidates: &[u64],
     shell_arch: &str,
 ) -> Option<PayloadVerdict> {
-    let mut best: Vec<(&'static str, u64)> = Vec::new();
+    let mut evidence: Vec<ArchEvidence> = Vec::new();
     for &off in candidates {
-        let Some((machine, raw_end)) = read_image_header(reader, off) else {
+        let Some(machine) = read_image_header(reader, off) else {
             continue;
         };
-        if let Some(name) = machine_name(machine)
-            && name != shell_arch
-        {
-            match best.iter_mut().find(|(arch, _)| *arch == name) {
-                Some(entry) => entry.1 = entry.1.max(raw_end),
-                None => best.push((name, raw_end)),
-            }
+        let ev = match machine_name(machine) {
+            Some(name) if name == shell_arch => continue,
+            Some("x86") => ArchEvidence::X86,
+            Some("x64") => ArchEvidence::X64,
+            Some("arm64") => ArchEvidence::Arm64,
+            Some(_) | None => ArchEvidence::Unrecognized,
+        };
+        if !evidence.contains(&ev) {
+            evidence.push(ev);
         }
     }
-    match best.len() {
-        0 => None,
-        1 => Some(PayloadVerdict::Arch(best[0].0.to_owned())),
-        _ => Some(PayloadVerdict::Mixed),
-    }
+    verdict_from_evidence(&evidence)
 }
 
-/// PE COFF machine type mapped to the `{Arch}` token.
+/// PE COFF machine type mapped to the `{Arch}` token. Machine types outside
+/// the supported platforms (ARM32 included) map to `None` and count as
+/// unrecognized evidence.
 fn machine_name(machine: u16) -> Option<&'static str> {
     match machine {
         0x014C => Some("x86"),
         0x8664 => Some("x64"),
         0xAA64 => Some("arm64"),
-        0x01C4 => Some("arm"),
         _ => None,
     }
 }
 
 /// Extracts every embedded OLE candidate and collects the MSI `Template`
-/// architectures. Unlike PE machinery, every plaintext MSI inside a
-/// bootstrapper is content (platform-specific payload MSIs), so a bundle of
-/// several platform MSIs counts as mixed evidence. Shell-arch matching MSIs
-/// are kept: a plain x86 bootstrapper around an x86 MSI stays x86.
+/// evidence. Unlike PE machinery, every plaintext MSI inside a bootstrapper
+/// is content (platform-specific payload MSIs), so a bundle of several
+/// platform MSIs merges per the combined-architecture rules. Shell-arch
+/// matching MSIs are kept: a plain x86 bootstrapper around an x86 MSI stays
+/// x86.
 fn embedded_msi_verdict<R: Read + Seek>(
     reader: &mut R,
     candidates: &[u64],
     file_len: u64,
 ) -> Option<PayloadVerdict> {
-    let mut archs: Vec<String> = Vec::new();
+    let mut evidence: Vec<ArchEvidence> = Vec::new();
     for &off in candidates.iter().take(MAX_EMBEDDED_MSI_CANDIDATES) {
         let Some(len) = file_len.checked_sub(off) else {
             continue;
@@ -327,22 +370,19 @@ fn embedded_msi_verdict<R: Read + Seek>(
         };
         let copied = std::io::copy(&mut reader.take(len), &mut out).unwrap_or(0);
         drop(out);
-        let arch = if copied == len {
-            msi_arch_from_file(&tmp)
+        let archs = if copied == len {
+            msi_evidence_from_file(&tmp)
         } else {
-            None
+            Vec::new()
         };
         let _ = std::fs::remove_file(&tmp);
-        if let Some(arch) = arch
-            && !archs.contains(&arch)
-        {
-            archs.push(arch);
+        for ev in archs {
+            if !evidence.contains(&ev) {
+                evidence.push(ev);
+            }
         }
     }
-    if archs.len() > 1 {
-        return Some(PayloadVerdict::Mixed);
-    }
-    archs.into_iter().next().map(PayloadVerdict::Arch)
+    verdict_from_evidence(&evidence)
 }
 
 /// Locates 7-Zip; a plain `7z` falls back to PATH resolution, and a missing
@@ -421,13 +461,13 @@ fn largest_container(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Judges unpacked NSIS contents across all unpack levels. Executables and
-/// MSIs are payload candidates and form the evidence set: PE hits matching
-/// the shell architecture carry no information (loader machinery such as
-/// uninstaller templates matches its loader), while every plaintext MSI is
-/// content, so platform-MSI bundles may report mixed. NSIS engine plugin
-/// DLLs are 32-bit loader components and are ignored entirely.
+/// MSIs are payload candidates and form the evidence set, merged per the
+/// combined-architecture rules: PE hits matching the shell architecture
+/// carry no information (loader machinery such as uninstaller templates
+/// matches its loader), while every plaintext MSI is content. NSIS engine
+/// plugin DLLs are 32-bit loader components and are ignored entirely.
 fn payload_verdict(dirs: &[PathBuf], shell_arch: &str) -> PayloadVerdict {
-    let mut archs: Vec<String> = Vec::new();
+    let mut evidence: Vec<ArchEvidence> = Vec::new();
     for dir in dirs {
         let mut files = Vec::new();
         collect_files(dir, &mut files);
@@ -441,28 +481,43 @@ fn payload_verdict(dirs: &[PathBuf], shell_arch: &str) -> PayloadVerdict {
             match ext.as_str() {
                 "exe" => {
                     let arch = binary_arch_from_file(path);
-                    if arch != "unknown" && arch != shell_arch && !archs.contains(&arch) {
-                        archs.push(arch);
+                    if let Some(ev) = arch_evidence(&arch)
+                        && arch != shell_arch
+                        && !evidence.contains(&ev)
+                    {
+                        evidence.push(ev);
                     }
                 }
                 "msi" => {
-                    if let Some(arch) = msi_arch_from_file(path)
-                        && !archs.contains(&arch)
-                    {
-                        archs.push(arch);
+                    for ev in msi_evidence_from_file(path) {
+                        if !evidence.contains(&ev) {
+                            evidence.push(ev);
+                        }
                     }
                 }
                 _ => {}
             }
         }
     }
-    if archs.len() > 1 {
-        return PayloadVerdict::Mixed;
+    if evidence.is_empty() {
+        return PayloadVerdict::NoEvidence;
     }
-    archs
-        .into_iter()
-        .next()
-        .map_or(PayloadVerdict::NoEvidence, PayloadVerdict::Arch)
+    match merge_architectures(&evidence) {
+        Some(arch) => PayloadVerdict::Arch(arch.to_owned()),
+        None => PayloadVerdict::Unknown,
+    }
+}
+
+/// Maps a binary architecture token to its evidence variant. ARM32 counts
+/// as unrecognized; unreadable images carry no evidence.
+fn arch_evidence(arch: &str) -> Option<ArchEvidence> {
+    match arch {
+        "x86" => Some(ArchEvidence::X86),
+        "x64" => Some(ArchEvidence::X64),
+        "arm64" => Some(ArchEvidence::Arm64),
+        "arm" => Some(ArchEvidence::Unrecognized),
+        _ => None,
+    }
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -608,10 +663,23 @@ mod tests {
     }
 
     #[test]
-    fn probe_reports_mixed_for_multiple_archs() {
+    fn probe_merges_x64_with_arm64() {
         let mut data = vec![0u8; 0x200];
         data.extend(pe_image(0x8664, &[(0x1000, 0x400)])); // x64 payload
         data.extend(pe_image(0xAA64, &[(0x1000, 0x400)])); // arm64 payload
+        data.extend_from_slice(&[0u8; 0x100]);
+        let mut cur = Cursor::new(data.as_slice());
+        assert!(matches!(
+            probe_reader(&mut cur, data.len() as u64, "x86"),
+            ReaderProbe::Found(arch) if arch == "x64+arm64"
+        ));
+    }
+
+    #[test]
+    fn probe_reports_unknown_for_arm32_evidence() {
+        let mut data = vec![0u8; 0x200];
+        data.extend(pe_image(0x8664, &[(0x1000, 0x400)])); // x64 payload
+        data.extend(pe_image(0x01C4, &[(0x1000, 0x400)])); // arm32 payload
         data.extend_from_slice(&[0u8; 0x100]);
         let mut cur = Cursor::new(data.as_slice());
         assert!(matches!(
@@ -621,13 +689,28 @@ mod tests {
     }
 
     #[test]
-    fn probe_flags_inno_as_opaque() {
+    fn merges_evidence_sets() {
+        use ArchEvidence::{Arm64, Unrecognized, X64, X86};
+        assert_eq!(merge_architectures(&[X86]), Some("x86"));
+        assert_eq!(merge_architectures(&[X64]), Some("x64"));
+        assert_eq!(merge_architectures(&[Arm64]), Some("arm64"));
+        assert_eq!(merge_architectures(&[X86, X64]), Some("x86"));
+        assert_eq!(merge_architectures(&[X86, Arm64]), Some("x86+arm64"));
+        assert_eq!(merge_architectures(&[X64, Arm64]), Some("x64+arm64"));
+        assert_eq!(merge_architectures(&[X86, X64, Arm64]), Some("x86+arm64"));
+        assert_eq!(merge_architectures(&[]), None);
+        assert_eq!(merge_architectures(&[X86, Unrecognized]), None);
+        assert_eq!(merge_architectures(&[Arm64, Unrecognized]), None);
+    }
+
+    #[test]
+    fn probe_falls_back_for_inno() {
         let mut data = vec![0u8; 64];
         data[8..29].copy_from_slice(INNO_TAG);
         let mut cur = Cursor::new(data.as_slice());
         assert!(matches!(
             probe_reader(&mut cur, data.len() as u64, "x86"),
-            ReaderProbe::Unknown
+            ReaderProbe::Inconclusive
         ));
     }
 
