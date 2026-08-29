@@ -1,3 +1,4 @@
+mod arch_probe;
 mod versioninfo;
 
 use std::ffi::{OsStr, OsString};

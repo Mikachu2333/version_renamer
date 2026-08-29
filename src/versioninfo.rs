@@ -5,6 +5,7 @@ use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::arch_probe::{ContentProbe, probe as probe_payload};
 use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows::Win32::Storage::FileSystem::{
     GET_FILE_VERSION_INFO_FLAGS, GetBinaryTypeW, GetFileVersionInfoExW, GetFileVersionInfoSizeExW,
@@ -53,7 +54,7 @@ struct FileTime {
 const SCS_ARM64_BINARY: u32 = 10;
 const SCS_ARMNT_BINARY: u32 = 12;
 
-const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+pub(crate) const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 const STRING_KEYS: [&str; 12] = [
     "ProductName",
@@ -220,6 +221,26 @@ fn detect_arch(path: PCWSTR) -> String {
     .to_owned()
 }
 
+/// Outer-image architecture of any file via `GetBinaryTypeW`, using the same
+/// tokens as [`detect_arch`]. Used on images unpacked from installers.
+pub(crate) fn binary_arch_from_file(path: &Path) -> String {
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    detect_arch(PCWSTR(wide.as_ptr()))
+}
+
+/// MSI payload architecture from its `Template` properties; `None` when the
+/// package is unreadable or carries no known platform token.
+pub(crate) fn msi_arch_from_file(path: &Path) -> Option<String> {
+    match from_msi(path) {
+        Ok(info) if !info.arch.is_empty() && info.arch != "unknown" => Some(info.arch),
+        _ => None,
+    }
+}
+
 fn split_version(ms: u32, ls: u32) -> [u32; 4] {
     [
         (ms >> 16) & 0xFFFF,
@@ -313,6 +334,23 @@ fn parse_version_parts(version: &str) -> [u32; 4] {
     parts
 }
 
+/// Installer shells are frequently 32-bit even when the payload they unpack
+/// is 64-bit, so an x86 outer image is not authoritative: probe the payload
+/// for the real architecture and let unrecognized shells stand as-is.
+fn apply_payload_probe(path: &Path, info: &mut VersionInfo) {
+    if info.arch != "x86" {
+        return;
+    }
+    match probe_payload(path, &info.arch) {
+        ContentProbe::Found(arch) => info.arch = arch,
+        // Rendered as U+FFFD by the pattern engine; a wrong "x86" would be
+        // worse than an explicit unknown. This covers multi-arch (fat)
+        // payloads as well as opaque installer formats.
+        ContentProbe::Unknown => info.arch.clear(),
+        ContentProbe::Inconclusive => {}
+    }
+}
+
 fn from_pe(path: &Path) -> windows::core::Result<VersionInfo> {
     let path_wide: Vec<u16> = path
         .as_os_str()
@@ -325,6 +363,7 @@ fn from_pe(path: &Path) -> windows::core::Result<VersionInfo> {
         arch: detect_arch(path_ptr),
         ..Default::default()
     };
+    apply_payload_probe(path, &mut info);
 
     unsafe {
         let mut handle = 0u32;
