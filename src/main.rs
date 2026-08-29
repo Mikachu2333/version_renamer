@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const DEFAULT_PATTERN: &str = "{Name}_{Arch}_{FileVer1}.{FileVer2}.{FileVer3}.{FileVer4}";
+const DEFAULT_PATTERN: &str = "{Name}_{Arch}_{VER}";
 const MAX_FILE_NAME_CHARS: usize = 255;
 
 fn main() -> ExitCode {
@@ -80,7 +80,9 @@ fn print_help(program: &OsString) {
     println!("  Fixed info:");
     println!("    {{FileType}}, {{FileSubtype}}, {{FileOS}}, {{Flags}}");
     println!();
-    println!("  Legacy aliases still work: {{VER-1}}..{{VER-4}}, {{PVER-1}}..{{PVER-4}}, {{P}},");
+    println!("  Legacy aliases still work:");
+    println!("   {{V}}, {{VER}}, {{VER-1}}..{{VER-4}},");
+    println!("   {{P}}, {{PRODVER}}, {{PVER-1}}..{{PVER-4}},");
     println!(
         "    {{TYPE}}, {{SUBTYPE}}, {{OS}}, {{INTERNAL}}, {{ORIGINAL}}, {{BUILD}}, {{SPECIAL}}"
     );
@@ -274,8 +276,8 @@ fn render_pattern(pattern: &str, info: &versioninfo::VersionInfo, original_name:
             let value = match token.as_str() {
                 "NAME" => name.as_str(),
                 "ARCH" => arch.as_str(),
-                "FILEVER" => file_version.as_str(),
-                "PRODUCTVER" | "PRODVER" | "P" => product_version.as_str(),
+                "V" | "VER" | "FILEVER" => file_version.as_str(),
+                "P" | "PRODVER" | "PRODUCTVER" => product_version.as_str(),
                 "FILEVER1" | "VER-1" => ver_parts[0].as_str(),
                 "FILEVER2" | "VER-2" => ver_parts[1].as_str(),
                 "FILEVER3" | "VER-3" => ver_parts[2].as_str(),
