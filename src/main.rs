@@ -246,8 +246,14 @@ fn render_pattern(pattern: &str, info: &versioninfo::VersionInfo, original_name:
     let original_filename = packer(&info.original_filename);
     let private_build = packer(&info.private_build);
     let special_build = packer(&info.special_build);
-    let product_version = packer(&info.product_version);
-    let file_version = packer(&info.file_version);
+    let (product_version, pver_parts) = version_values(
+        &info.product_version,
+        info.fixed.as_ref().map(|fixed| fixed.product_version),
+    );
+    let (file_version, ver_parts) = version_values(
+        &info.file_version,
+        info.fixed.as_ref().map(|fixed| fixed.file_version),
+    );
     let (file_type, file_subtype, file_os, file_flags) = match &info.fixed {
         Some(f) => (
             f.file_type.clone(),
@@ -257,15 +263,6 @@ fn render_pattern(pattern: &str, info: &versioninfo::VersionInfo, original_name:
         ),
         None => (String::new(), String::new(), String::new(), String::new()),
     };
-    let ver_parts: [String; 4] = match &info.fixed {
-        Some(f) => f.file_version.map(|n| n.to_string()),
-        None => [1, 2, 3, 4].map(|n| version_part(&file_version, n)),
-    };
-    let pver_parts: [String; 4] = info
-        .fixed
-        .as_ref()
-        .map(|f| f.product_version.map(|n| n.to_string()))
-        .unwrap_or_default();
     let mut out = String::new();
     let mut rest = pattern;
     while let Some(start) = rest.find('{') {
@@ -317,6 +314,20 @@ fn render_pattern(pattern: &str, info: &versioninfo::VersionInfo, original_name:
     }
     out.push_str(rest);
     out
+}
+
+fn version_values(text: &OsStr, fixed: Option<[u32; 4]>) -> (String, [String; 4]) {
+    let text = text.to_string_lossy();
+    let parts = fixed.map_or_else(
+        || [1, 2, 3, 4].map(|index| version_part(&text, index)),
+        |numbers| numbers.map(|number| number.to_string()),
+    );
+    let full = if text.is_empty() && fixed.is_some() {
+        parts.join(".")
+    } else {
+        text.into_owned()
+    };
+    (full, parts)
 }
 
 fn version_part(version: &str, index: usize) -> String {
@@ -471,6 +482,29 @@ mod tests {
             OsStr::new("x.exe"),
         );
         assert_eq!(out, "10.0.26100.8875 (extra)");
+    }
+
+    #[test]
+    fn missing_version_strings_use_their_respective_fixed_versions() {
+        let mut info = sample_info();
+        info.file_version.clear();
+        info.product_version.clear();
+        let out = render_pattern("{VER}-{ProductVer}", &info, OsStr::new("x.exe"));
+        assert_eq!(out, "1.2.3.4-5.6.7.8");
+    }
+
+    #[test]
+    fn product_version_parts_use_text_when_no_fixed_version_exists() {
+        let info = versioninfo::VersionInfo {
+            product_version: "3.2.1-beta".into(),
+            ..Default::default()
+        };
+        let out = render_pattern(
+            "{P}:{PVER-1}:{ProductVer3}:{PVER-4}",
+            &info,
+            OsStr::new("x.exe"),
+        );
+        assert_eq!(out, "3.2.1-beta:3:1-beta:\u{FFFD}");
     }
 
     #[test]
